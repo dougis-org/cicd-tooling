@@ -1,0 +1,85 @@
+name: Sync openspec-shared submodule
+
+on:
+  workflow_call:
+    inputs:
+      submodule-path:
+        description: 'Path to the openspec-shared submodule relative to the repo root'
+        required: false
+        type: string
+        default: '.github/openspec-shared'
+
+# Prevent overlapping sync jobs; let each run finish so a trailing no-op
+# cleans up rather than cancelling a mid-commit run.
+concurrency:
+  group: sync-openspec-shared-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # Skip automation-generated commits to prevent recursive triggering.
+    # When this workflow pushes "[ci-submodule-sync]" to main, the resulting
+    # push event will have actor=github-actions[bot] and this guard fires.
+    if: github.actor != 'github-actions[bot]'
+
+    steps:
+      - name: Checkout main with submodules
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          submodules: true
+          fetch-depth: 1
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Update submodule to upstream main
+        id: update
+        env:
+          SUBMODULE_PATH: ${{ inputs.submodule-path }}
+        run: |
+          # Record the pointer currently committed in this repo
+          BEFORE=$(git submodule status "$SUBMODULE_PATH" | awk '{print $1}' | tr -d '+')
+          echo "Current submodule pointer : $BEFORE"
+
+          # Fetch and move the submodule to the latest commit on its upstream main
+          git submodule update --remote "$SUBMODULE_PATH"
+
+          # Record the new working-tree pointer
+          AFTER=$(git submodule status "$SUBMODULE_PATH" | awk '{print $1}' | tr -d '+')
+          echo "Upstream submodule pointer: $AFTER"
+
+          if [ "$BEFORE" = "$AFTER" ]; then
+            echo "submodule_changed=false" >> "$GITHUB_OUTPUT"
+            echo "No-op: $SUBMODULE_PATH is already current at $AFTER"
+          else
+            echo "submodule_changed=true" >> "$GITHUB_OUTPUT"
+            echo "Updated: $SUBMODULE_PATH $BEFORE -> $AFTER"
+          fi
+
+      - name: Commit and push submodule update
+        if: steps.update.outputs.submodule_changed == 'true'
+        env:
+          SUBMODULE_PATH: ${{ inputs.submodule-path }}
+        run: |
+          # Stage only the submodule pointer file
+          git add "$SUBMODULE_PATH"
+
+          # Safety guard: abort if anything other than the submodule is staged
+          STAGED=$(git diff --cached --name-only)
+          if [ "$STAGED" != "$SUBMODULE_PATH" ]; then
+            echo "ERROR: unexpected staged files detected: $STAGED"
+            echo "Aborting to prevent unintended changes outside $SUBMODULE_PATH"
+            exit 1
+          fi
+
+          # Deterministic commit message used as a traceability marker and loop guard
+          git commit -m "chore: sync $SUBMODULE_PATH to upstream main [ci-submodule-sync]"
+          git push origin main
+          echo "Pushed submodule pointer update to main"

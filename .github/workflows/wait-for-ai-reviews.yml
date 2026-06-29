@@ -1,0 +1,150 @@
+name: Wait for AI reviews
+
+on:
+  workflow_call:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  checks: read
+  pull-requests: read
+
+jobs:
+  wait-for-ai-reviews:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 11
+    steps:
+      - name: Wait until AI reviews are complete
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner
+            const repo = context.repo.repo
+            const ref = context.payload.pull_request?.head?.sha ?? context.sha
+            const pullNumber =
+              context.payload.pull_request?.number ??
+              (
+                await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                  owner,
+                  repo,
+                  commit_sha: ref,
+                })
+              ).data.find((pullRequest) => pullRequest.state === 'open')?.number
+            const reviewers = [
+              {
+                label: 'Copilot',
+                checkPatterns: [/copilot/i],
+                reviewAuthors: ['copilot-pull-request-reviewer[bot]'],
+              },
+            ]
+            const initialSleepMs = 3 * 60_000
+            const followUpPollIntervalMs = 90_000
+            const followUpPollIterations = 4
+            const finalPollIntervalMs = 45_000
+            const maxWaitMs = 10 * 60_000
+            const startTime = Date.now()
+            let pollCount = 0
+
+            const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+            const getNextPollIntervalMs = (elapsedMs, completedPolls) => {
+              const remainingMs = maxWaitMs - elapsedMs
+              if (remainingMs <= 0) {
+                return 0
+              }
+
+              if (completedPolls < followUpPollIterations) {
+                return Math.min(followUpPollIntervalMs, remainingMs)
+              }
+
+              return Math.min(finalPollIntervalMs, remainingMs)
+            }
+
+            core.info(`Delaying the first AI review check for ${Math.ceil(initialSleepMs / 1000)} seconds...`)
+            await wait(initialSleepMs)
+
+            while (true) {
+              const { data } = await github.rest.checks.listForRef({
+                owner,
+                repo,
+                ref,
+                per_page: 100,
+              })
+              const reviews = pullNumber
+                ? await github.paginate(github.rest.pulls.listReviews, {
+                    owner,
+                    repo,
+                    pull_number: pullNumber,
+                    per_page: 100,
+                  })
+                : []
+
+              const checkRuns = data.check_runs ?? []
+              const reviewStates = reviewers.map((reviewer) => {
+                const matchingChecks = checkRuns.filter((check) =>
+                  reviewer.checkPatterns.some((pattern) => pattern.test(check.name)),
+                )
+                const completedChecks = matchingChecks.filter(
+                  (check) =>
+                    check.status === 'completed' && check.conclusion === 'success',
+                )
+                const submittedReviews = reviews.filter((review) => {
+                  const login = review.user?.login?.toLowerCase()
+                  const state = review.state?.toUpperCase()
+
+                  return (
+                    Boolean(review.submitted_at) &&
+                    Boolean(login) &&
+                    reviewer.reviewAuthors.includes(login) &&
+                    state !== 'PENDING' &&
+                    state !== 'DISMISSED'
+                  )
+                })
+                const currentReviews = submittedReviews.filter(
+                  (review) => review.commit_id === ref,
+                )
+                const hasHistoricalReview = submittedReviews.length > 0
+
+                return {
+                  label: reviewer.label,
+                  matching: matchingChecks.length,
+                  completedChecks: completedChecks.length,
+                  reviews: currentReviews.length,
+                  historicalReviews: submittedReviews.length,
+                  complete: completedChecks.length > 0 || hasHistoricalReview,
+                }
+              })
+
+              const allComplete = reviewStates.every((state) => state.complete)
+
+              core.info(`Observed ${checkRuns.length} check run(s) on ${ref}`)
+              core.info(
+                pullNumber
+                  ? `Observed ${reviews.length} review record(s) on PR #${pullNumber}`
+                  : 'No associated pull request found for review polling; relying on check runs only.',
+              )
+              for (const state of reviewStates) {
+                core.info(
+                  `${state.label}: ${state.completedChecks}/${state.matching} successful check(s), ${state.reviews} current-head review(s), ${state.historicalReviews} total submitted review(s), complete=${state.complete}`,
+                )
+              }
+
+              if (allComplete) {
+                core.info('AI reviews are complete.')
+                return
+              }
+
+              const elapsedMs = Date.now() - startTime
+              if (elapsedMs >= maxWaitMs) {
+                core.info('Reached 10 minute wait gate. Passing workflow even though checks are not complete yet.')
+                return
+              }
+
+              const sleepMs = getNextPollIntervalMs(elapsedMs, pollCount)
+              core.info(`Checks not complete yet. Sleeping for ${Math.ceil(sleepMs / 1000)} seconds...`)
+              await wait(sleepMs)
+              pollCount += 1
+            }

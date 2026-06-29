@@ -1,0 +1,47 @@
+name: 'Codacy Coverage Reporter'
+description: 'Downloads and runs the Codacy Coverage Reporter CLI'
+inputs:
+  codacy-api-token:
+    description: 'Codacy API Token'
+    required: true
+  codacy-username:
+    description: 'Codacy organization/username (e.g. dougis-org)'
+    required: true
+  codacy-project-name:
+    description: 'Codacy project name (must match the repo name in Codacy)'
+    required: true
+  coverage-file:
+    description: 'Path to the coverage report file (e.g. coverage/lcov.info)'
+    required: false
+    default: ''
+  final:
+    description: 'Whether to run the finalization command'
+    required: false
+    default: 'false'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Run Codacy Coverage Reporter
+      shell: bash
+      env:
+        CODACY_API_TOKEN: ${{ inputs.codacy-api-token }}
+        CODACY_ORGANIZATION_PROVIDER: gh
+        CODACY_USERNAME: ${{ inputs.codacy-username }}
+        CODACY_PROJECT_NAME: ${{ inputs.codacy-project-name }}
+      run: |
+        curl -Ls https://coverage.codacy.com/get.sh -o codacy-coverage-reporter.sh
+        chmod +x codacy-coverage-reporter.sh
+
+        if [ "${{ inputs.final }}" = "true" ]; then
+          echo "Finalizing coverage on Codacy..."
+          ./codacy-coverage-reporter.sh final
+        else
+          if [ -n "${{ inputs.coverage-file }}" ] && [ -f "${{ inputs.coverage-file }}" ] && [ -s "${{ inputs.coverage-file }}" ]; then
+            echo "Uploading coverage from ${{ inputs.coverage-file }}..."
+            ./codacy-coverage-reporter.sh report --partial -l Javascript -r "${{ inputs.coverage-file }}"
+            ./codacy-coverage-reporter.sh report --partial -l TypeScript -r "${{ inputs.coverage-file }}"
+          else
+            echo "Coverage file not found or empty at '${{ inputs.coverage-file }}'; skipping upload"
+          fi
+        fi
