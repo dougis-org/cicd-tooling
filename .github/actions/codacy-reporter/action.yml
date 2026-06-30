@@ -30,6 +30,10 @@ runs:
         CODACY_USERNAME: ${{ inputs.codacy-username }}
         CODACY_PROJECT_NAME: ${{ inputs.codacy-project-name }}
       run: |
+        if [ -z "$CODACY_API_TOKEN" ]; then
+          echo "CODACY_API_TOKEN not set (fork PR or missing secret), skipping coverage upload"
+          exit 0
+        fi
         curl -Ls https://coverage.codacy.com/get.sh -o codacy-coverage-reporter.sh
         chmod +x codacy-coverage-reporter.sh
 
