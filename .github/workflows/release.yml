@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history needed to list all tags
+
+      - name: Compute next version
+        id: version
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+
+          # Classify commit
+          if echo "$COMMIT_MSG" | grep -qE '^[a-z]+(\([^)]+\))?!:' || \
+             echo "$COMMIT_MSG" | grep -qE '^BREAKING CHANGE:'; then
+            BUMP=major
+          elif echo "$COMMIT_MSG" | grep -qE '^feat(\([^)]+\))?:'; then
+            BUMP=minor
+          elif echo "$COMMIT_MSG" | grep -qE '^fix(\([^)]+\))?:'; then
+            BUMP=patch
+          else
+            echo "Non-conventional commit — skipping release."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Bump type: $BUMP"
+
+          # Find latest semver tag
+          LATEST=$(git tag --list 'v*.*.*' --sort=-version:refname | head -1)
+
+          if [ -z "$LATEST" ]; then
+            echo "No existing tag — bootstrapping at v1.0.0"
+            NEW_TAG="v1.0.0"
+          else
+            echo "Latest tag: $LATEST"
+            # Strip leading 'v'
+            VERSION="${LATEST#v}"
+            MAJOR=$(echo "$VERSION" | cut -d. -f1)
+            MINOR=$(echo "$VERSION" | cut -d. -f2)
+            PATCH=$(echo "$VERSION" | cut -d. -f3)
+
+            case "$BUMP" in
+              major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+              minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+              patch) PATCH=$((PATCH + 1)) ;;
+            esac
+
+            NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          fi
+
+          echo "New tag: $NEW_TAG"
+          echo "skip=false"        >> "$GITHUB_OUTPUT"
+          echo "new_tag=$NEW_TAG"  >> "$GITHUB_OUTPUT"
+          echo "major=v$(echo "$NEW_TAG" | cut -d. -f1 | tr -d 'v')" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        if: steps.version.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW_TAG: ${{ steps.version.outputs.new_tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$NEW_TAG" \
+            --generate-notes \
+            --title "$NEW_TAG"
+          echo "Created release $NEW_TAG"
+
+      - name: Update floating major tag
+        if: steps.version.outputs.skip != 'true'
+        env:
+          MAJOR_TAG: ${{ steps.version.outputs.major }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f "$MAJOR_TAG"
+          git push origin "$MAJOR_TAG" --force
+          echo "Updated floating tag $MAJOR_TAG"
